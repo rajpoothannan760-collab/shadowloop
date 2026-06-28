@@ -2,8 +2,8 @@
 """
 shadowloop.py
 ─────────────
-Monitors the current directory for file changes, runs a verification
-command, and auto-commits when tests pass.
+Monitors the current directory for file changes, runs unit tests,
+and auto-commits when tests pass.
 
 Usage:
     python shadowloop.py [--cmd "python -m unittest"]
@@ -12,14 +12,12 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import io
 import shlex
 import shutil
 import subprocess
 import sys
 import threading
 import time
-from datetime import datetime
 from pathlib import Path
 
 # Force UTF-8 output on Windows (avoids cp1252 UnicodeEncodeError)
@@ -33,7 +31,6 @@ from watchdog.observers import Observer
 
 EXCLUDED_DIRS: frozenset[str] = frozenset({".git", ".venv", "__pycache__"})
 DEBOUNCE_SECONDS: float = 2.0
-STDERR_TAIL_LINES: int = 50
 
 # Resolve git at import time; fall back to known Windows install path
 GIT_EXE: str = (
@@ -43,33 +40,12 @@ GIT_EXE: str = (
 
 # ── ANSI helpers ─────────────────────────────────────────────────────────────
 
-RESET  = "\033[0m"
-BOLD   = "\033[1m"
-RED    = "\033[31m"
-GREEN  = "\033[32m"
-YELLOW = "\033[33m"
-CYAN   = "\033[36m"
-DIM    = "\033[2m"
+RESET = "\033[0m"
+BOLD  = "\033[1m"
+RED   = "\033[31m"
+GREEN = "\033[32m"
+DIM   = "\033[2m"
 
-
-def _panel(title: str, color: str, lines: list[str] | None = None) -> None:
-    """Print a bordered status panel to stdout."""
-    width = 60
-    bar = "─" * width
-    timestamp = datetime.now().strftime("%H:%M:%S")
-    print(f"\n{color}{BOLD}┌{bar}┐{RESET}")
-    print(f"{color}{BOLD}│  {title:<{width - 2}}│{RESET}")
-    print(f"{color}{BOLD}│  {DIM}{timestamp:<{width - 2}}{RESET}{color}{BOLD}│{RESET}")
-    print(f"{color}{BOLD}└{bar}┘{RESET}")
-    if lines:
-        print(f"{DIM}{'─' * width}{RESET}")
-        for line in lines:
-            print(f"  {line}")
-        print(f"{DIM}{'─' * width}{RESET}")
-    print()
-
-
-# ── Core logic ───────────────────────────────────────────────────────────────
 
 def _is_excluded(path: str) -> bool:
     """Return True if any component of *path* is an excluded directory."""
@@ -80,34 +56,35 @@ def _run(cmd: list[str]) -> subprocess.CompletedProcess[str]:
     return subprocess.run(cmd, capture_output=True, text=True)
 
 
-def run_verification_loop(cmd: list[str]) -> None:
+def run_verification_loop(cmd: list[str], watch_root: Path) -> None:
     """Execute the verification command and react to its result."""
-    print(f"{CYAN}{BOLD}> {' '.join(cmd)}{RESET}  {DIM}(running...){RESET}")
-
     result = _run(cmd)
 
     if result.returncode != 0:
-        # ── Failure path ─────────────────────────────────────────────────
-        stderr_lines = (result.stderr or result.stdout or "").strip().splitlines()
-        tail = stderr_lines[-STDERR_TAIL_LINES:]
-        _panel("[REPAIR LOOP ACTIVE]  Tests failed — inspect errors below", RED, tail)
+        # ── Failure path: minimal red warning, isolate the error ──────────
+        err = (result.stderr or result.stdout or "").strip()
+        # Keep only the last meaningful line (traceback tail or assertion)
+        lines = [l for l in err.splitlines() if l.strip()]
+        tail = lines[-1] if lines else "tests failed (no output)"
+        print(f"\n{RED}{BOLD}✗ Tests failed:{RESET} {RED}{tail}{RESET}\n")
 
     else:
-        # ── Success path ─────────────────────────────────────────────────
-        _panel("[VALIDATION PASSED]  Auto-committing changes…", GREEN)
-
-        add = _run([GIT_EXE, "add", "-A"])
+        # ── Success path: autonomous git add . && git commit ───────────────
+        add = subprocess.run(["git", "add", "."], capture_output=True, text=True, cwd=watch_root)
         if add.returncode != 0:
-            print(f"{RED}git add failed:{RESET}\n{add.stderr.strip()}")
+            print(f"{RED}git add failed:{RESET} {add.stderr.strip()}\n")
             return
 
-        commit = _run([GIT_EXE, "commit", "-m", "shadowloop: automatic test pass"])
+        commit = subprocess.run(
+            ["git", "commit", "-m", "shadowloop: automatic test pass"],
+            capture_output=True, text=True, cwd=watch_root
+        )
         if commit.returncode == 0:
-            print(f"{GREEN}{commit.stdout.strip()}{RESET}\n")
+            print(f"\n{GREEN}{BOLD}[AUTONOMOUS COMMIT EXECUTED]{RESET} {commit.stdout.strip()}\n")
         else:
             # Gracefully handle "nothing to commit"
-            msg = commit.stdout.strip() or commit.stderr.strip()
-            print(f"{YELLOW}{msg}{RESET}\n")
+            msg = (commit.stdout or commit.stderr or "").strip()
+            print(f"\n{YELLOW}{msg}{RESET}\n")
 
 
 # ── Watchdog handler ─────────────────────────────────────────────────────────
@@ -115,9 +92,10 @@ def run_verification_loop(cmd: list[str]) -> None:
 class _DebounceHandler(FileSystemEventHandler):
     """Debounced handler — waits DEBOUNCE_SECONDS after the last event."""
 
-    def __init__(self, cmd: list[str]) -> None:
+    def __init__(self, cmd: list[str], watch_root: Path) -> None:
         super().__init__()
         self._cmd = cmd
+        self._watch_root = watch_root
         self._lock = threading.Lock()
         self._timer: threading.Timer | None = None
 
@@ -139,10 +117,10 @@ class _DebounceHandler(FileSystemEventHandler):
             self._timer.start()
 
     def _fire(self) -> None:
-        run_verification_loop(self._cmd)
+        run_verification_loop(self._cmd, self._watch_root)
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Entry point ──────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(
@@ -153,19 +131,22 @@ def main() -> None:
         default="python -m unittest",
         help='Verification command to run (default: "python -m unittest")',
     )
+    parser.add_argument(
+        "--path",
+        default=".",
+        help="Target project directory to watch (default: current directory)",
+    )
     args = parser.parse_args()
     cmd: list[str] = shlex.split(args.cmd)
+    watch_root = Path(args.path).resolve()
 
-    watch_root = Path(".").resolve()
+    print(f"{BOLD}ShadowLoop{RESET} — watching {watch_root}")
+    print(f"  {DIM}Command  :{RESET} {' '.join(cmd)}")
+    print(f"  {DIM}Debounce :{RESET} {DEBOUNCE_SECONDS}s")
+    print(f"  {DIM}Excluded :{RESET} {', '.join(sorted(EXCLUDED_DIRS))}")
+    print(f"  {DIM}Stop     :{RESET} Ctrl+C\n")
 
-    print(f"\n{BOLD}ShadowLoop{RESET} — infrastructure monitor")
-    print(f"  {DIM}Watch root :{RESET} {watch_root}")
-    print(f"  {DIM}Command    :{RESET} {' '.join(cmd)}")
-    print(f"  {DIM}Debounce   :{RESET} {DEBOUNCE_SECONDS}s")
-    print(f"  {DIM}Excluded   :{RESET} {', '.join(sorted(EXCLUDED_DIRS))}")
-    print(f"  {DIM}Stop with  :{RESET} Ctrl+C\n")
-
-    handler = _DebounceHandler(cmd)
+    handler = _DebounceHandler(cmd, watch_root)
     observer = Observer()
     observer.schedule(handler, str(watch_root), recursive=True)
     observer.start()
